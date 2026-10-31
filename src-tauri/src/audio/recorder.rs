@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Represents extracted audio samples with their associated sample rate.
@@ -29,6 +29,10 @@ pub struct AudioRecorder {
     mic_sample_rate: u32,
     /// Sample rate of system audio recording.
     system_sample_rate: u32,
+    /// Real-time normalized RMS level of microphone (f32 bits, 0.0 - 1.0).
+    mic_level: Arc<AtomicU32>,
+    /// Real-time normalized RMS level of system loopback (f32 bits, 0.0 - 1.0).
+    system_level: Arc<AtomicU32>,
 }
 
 // SAFETY: `cpal::Stream` is `Send` on desktop platforms Tauri targets.
@@ -46,14 +50,36 @@ impl AudioRecorder {
             system_enabled: Arc::new(AtomicBool::new(true)),
             mic_sample_rate: 16000,
             system_sample_rate: 16000,
+            mic_level: Arc::new(AtomicU32::new(0)),
+            system_level: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Returns handle to the live mic level atomic (f32 bits).
+    pub fn mic_level(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.mic_level)
+    }
+
+    /// Returns handle to the live system loopback level atomic (f32 bits).
+    pub fn system_level(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.system_level)
     }
 
     /// Toggles capture on or off for the specified track ("mic" or "system").
     pub fn set_track_enabled(&self, track: &str, enabled: bool) {
         match track {
-            "mic" => self.mic_enabled.store(enabled, Ordering::SeqCst),
-            "system" => self.system_enabled.store(enabled, Ordering::SeqCst),
+            "mic" => {
+                self.mic_enabled.store(enabled, Ordering::SeqCst);
+                if !enabled {
+                    self.mic_level.store(0, Ordering::Relaxed);
+                }
+            }
+            "system" => {
+                self.system_enabled.store(enabled, Ordering::SeqCst);
+                if !enabled {
+                    self.system_level.store(0, Ordering::Relaxed);
+                }
+            }
             _ => eprintln!("Unknown audio track: {track}"),
         }
     }
@@ -103,6 +129,7 @@ impl AudioRecorder {
             &mic_config,
             Arc::clone(&self.mic_buffer),
             Arc::clone(&self.mic_enabled),
+            Arc::clone(&self.mic_level),
         )
         .map_err(|e| format!("Failed to build microphone stream: {e}"))?;
 
@@ -134,6 +161,7 @@ impl AudioRecorder {
                         &sys_config,
                         Arc::clone(&self.system_buffer),
                         Arc::clone(&self.system_enabled),
+                        Arc::clone(&self.system_level),
                     ) {
                         Ok(sys_stream) => {
                             if let Err(e) = sys_stream.play() {
@@ -162,6 +190,8 @@ impl AudioRecorder {
     pub fn stop(&mut self) {
         self.mic_stream = None;
         self.system_stream = None;
+        self.mic_level.store(0, Ordering::Relaxed);
+        self.system_level.store(0, Ordering::Relaxed);
     }
 
     /// Drains both mic and system audio buffers, returning `(mic_track, system_track)`.
@@ -216,13 +246,31 @@ impl AudioRecorder {
     }
 }
 
+/// Helper function to update smoothed real-time volume levels with fast attack & smooth release.
+#[inline]
+fn update_smoothed_level(level_handle: &AtomicU32, rms: f32) {
+    // Normal speech in typical mics is between 0.02 and 0.25 RMS.
+    // Scale factor 4.5 maps typical speech to dynamic 0.10 - 0.95 range.
+    let normalized = (rms * 4.5).min(1.0);
+    let prev_val = f32::from_bits(level_handle.load(Ordering::Relaxed));
+    let smoothed = if normalized > prev_val {
+        // Fast attack for crisp responsiveness when voice begins
+        prev_val * 0.35 + normalized * 0.65
+    } else {
+        // Smooth release for natural acoustic decay
+        prev_val * 0.82 + normalized * 0.18
+    };
+    level_handle.store(smoothed.to_bits(), Ordering::Relaxed);
+}
+
 /// Helper to build a CPAL input stream for a device with downmixing to mono f32
-/// and atomic enable gating.
+/// and atomic enable gating with live level calculation.
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     buffer_handle: Arc<Mutex<Vec<f32>>>,
     enabled_handle: Arc<AtomicBool>,
+    level_handle: Arc<AtomicU32>,
 ) -> Result<cpal::Stream, String> {
     let channels = config.channels() as usize;
 
@@ -231,8 +279,22 @@ fn build_stream(
             &config.clone().into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if !enabled_handle.load(Ordering::Relaxed) {
+                    level_handle.store(0, Ordering::Relaxed);
                     return;
                 }
+
+                // Compute RMS level
+                let mut sum_sq = 0.0f32;
+                for &s in data {
+                    sum_sq += s * s;
+                }
+                let rms = if !data.is_empty() {
+                    (sum_sq / data.len() as f32).sqrt()
+                } else {
+                    0.0
+                };
+                update_smoothed_level(&level_handle, rms);
+
                 if let Ok(mut buf) = buffer_handle.lock() {
                     if channels == 1 {
                         buf.extend_from_slice(data);
@@ -253,8 +315,22 @@ fn build_stream(
             &config.clone().into(),
             move |data: &[i16], _: &cpal::InputCallbackInfo| {
                 if !enabled_handle.load(Ordering::Relaxed) {
+                    level_handle.store(0, Ordering::Relaxed);
                     return;
                 }
+
+                let mut sum_sq = 0.0f32;
+                for &s in data {
+                    let f = s as f32 / 32768.0;
+                    sum_sq += f * f;
+                }
+                let rms = if !data.is_empty() {
+                    (sum_sq / data.len() as f32).sqrt()
+                } else {
+                    0.0
+                };
+                update_smoothed_level(&level_handle, rms);
+
                 if let Ok(mut buf) = buffer_handle.lock() {
                     if channels == 1 {
                         buf.extend(data.iter().map(|&s| cpal::Sample::to_sample::<f32>(s)));
@@ -278,8 +354,22 @@ fn build_stream(
             &config.clone().into(),
             move |data: &[u16], _: &cpal::InputCallbackInfo| {
                 if !enabled_handle.load(Ordering::Relaxed) {
+                    level_handle.store(0, Ordering::Relaxed);
                     return;
                 }
+
+                let mut sum_sq = 0.0f32;
+                for &s in data {
+                    let f = (s as f32 - 32768.0) / 32768.0;
+                    sum_sq += f * f;
+                }
+                let rms = if !data.is_empty() {
+                    (sum_sq / data.len() as f32).sqrt()
+                } else {
+                    0.0
+                };
+                update_smoothed_level(&level_handle, rms);
+
                 if let Ok(mut buf) = buffer_handle.lock() {
                     if channels == 1 {
                         buf.extend(data.iter().map(|&s| cpal::Sample::to_sample::<f32>(s)));

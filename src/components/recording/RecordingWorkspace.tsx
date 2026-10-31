@@ -9,6 +9,7 @@ interface RecordingWorkspaceProps {
   isPaused: boolean;
   micEnabled: boolean;
   systemAudioEnabled: boolean;
+  audioLevel?: number;
   onToggleTrack: (track: "mic" | "system") => void;
   onTogglePause: () => void;
   onStopAndSave: () => void;
@@ -20,6 +21,7 @@ export const RecordingWorkspace: React.FC<RecordingWorkspaceProps> = ({
   isPaused,
   micEnabled,
   systemAudioEnabled,
+  audioLevel,
   onToggleTrack,
   onTogglePause,
   onStopAndSave,
@@ -36,8 +38,13 @@ export const RecordingWorkspace: React.FC<RecordingWorkspaceProps> = ({
         {/* Classic Editorial Serif Timer */}
         <div className="classic-timer">{formatElapsed(elapsed)}</div>
 
-        {/* Symmetrical Diamond Waveform */}
-        <Waveform elapsed={elapsed} isPaused={isPaused} />
+        {/* Dynamic Regulated Audio Waveform */}
+        <Waveform
+          isPaused={isPaused}
+          audioLevel={audioLevel}
+          micEnabled={micEnabled}
+          systemAudioEnabled={systemAudioEnabled}
+        />
 
         {/* In/Out Audio Track Control Buttons */}
         <div className="track-controls-pills">

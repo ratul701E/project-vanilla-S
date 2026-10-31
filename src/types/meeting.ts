@@ -37,3 +37,10 @@ export interface TrackState {
   mic_enabled: boolean;
   system_enabled: boolean;
 }
+
+export interface AudioMeterPayload {
+  mic_level: number;
+  system_level: number;
+  level: number;
+}
+

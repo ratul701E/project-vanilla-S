@@ -40,6 +40,14 @@ pub struct LiveLanguagePayload {
     pub is_speech_active: bool,
 }
 
+/// Payload sent via Tauri event for real-time RMS audio meter telemetry (0.0 to 1.0).
+#[derive(Clone, Serialize)]
+pub struct AudioMeterPayload {
+    pub mic_level: f32,
+    pub system_level: f32,
+    pub level: f32,
+}
+
 /// Sets track enabled state ("mic" or "system").
 #[tauri::command]
 pub async fn set_track_state(
@@ -85,6 +93,9 @@ pub async fn start_meeting(
 
     recorder.start()?;
 
+    let mic_level_handle = recorder.mic_level();
+    let sys_level_handle = recorder.system_level();
+
     // Record when the meeting started for duration calculation.
     let mut start_time = state
         .meeting_start
@@ -123,6 +134,42 @@ pub async fn start_meeting(
 
             let _ = app_emitter.emit("live_language_detected", payload);
         }
+    });
+
+    // Spawn high-efficiency 50ms real-time audio meter telemetry loop (20 Hz)
+    let meter_recording_flag = Arc::clone(&state.is_recording);
+    let meter_emitter = app_handle.clone();
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
+        while meter_recording_flag.load(Ordering::SeqCst) {
+            interval.tick().await;
+            if !meter_recording_flag.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let mic = f32::from_bits(mic_level_handle.load(Ordering::Relaxed));
+            let sys = f32::from_bits(sys_level_handle.load(Ordering::Relaxed));
+            let level = mic.max(sys);
+
+            let payload = AudioMeterPayload {
+                mic_level: mic,
+                system_level: sys,
+                level,
+            };
+
+            let _ = meter_emitter.emit("audio_meter", payload);
+        }
+
+        // When recording ends, emit resting zero level
+        let _ = meter_emitter.emit(
+            "audio_meter",
+            AudioMeterPayload {
+                mic_level: 0.0,
+                system_level: 0.0,
+                level: 0.0,
+            },
+        );
     });
 
     Ok("Recording started".to_string())

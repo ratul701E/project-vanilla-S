@@ -11,6 +11,7 @@ import {
   LiveLanguagePayload,
   StopAndTranscribeResult,
   TrackState,
+  AudioMeterPayload,
 } from "./types/meeting";
 
 export type { MeetingRecord, TranscriptSegment, MeetingDetail };
@@ -23,7 +24,7 @@ import { IdleWorkspace } from "./components/idle/IdleWorkspace";
 import { TranscribingOverlay } from "./components/common/TranscribingOverlay";
 import { ErrorBanner } from "./components/common/ErrorBanner";
 import { Toast } from "./components/common/Toast";
-import { ArrowLeftIcon, WaveformIcon } from "./components/common/Icons";
+import { ArrowLeftIcon } from "./components/common/Icons";
 import { formatDateMeta } from "./utils/formatters";
 import { PanelRightOpen, PanelLeftOpen } from "lucide-react";
 
@@ -35,6 +36,9 @@ export default function App() {
   const [isPaused, setIsPaused] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+
+  // Real-time audio RMS level from audio capture stream (0.0 to 1.0)
+  const [audioLevel, setAudioLevel] = useState(0);
 
   // Audio track states (In / Out)
   const [micEnabled, setMicEnabled] = useState(true);
@@ -133,9 +137,10 @@ export default function App() {
     fetchHistory();
   }, [fetchHistory]);
 
-  // ── Listen to live language detection events ──
+  // ── Listen to live telemetry events ──
   useEffect(() => {
-    let unlistenFn: (() => void) | null = null;
+    let unlistenLangFn: (() => void) | null = null;
+    let unlistenMeterFn: (() => void) | null = null;
 
     listen<LiveLanguagePayload>("live_language_detected", (event) => {
       if (event.payload?.language) {
@@ -143,16 +148,27 @@ export default function App() {
       }
     })
       .then((fn) => {
-        unlistenFn = fn;
+        unlistenLangFn = fn;
       })
       .catch((err) => {
         console.warn("Could not attach live_language_detected listener:", err);
       });
 
-    return () => {
-      if (unlistenFn) {
-        unlistenFn();
+    listen<AudioMeterPayload>("audio_meter", (event) => {
+      if (event.payload && typeof event.payload.level === "number") {
+        setAudioLevel(event.payload.level);
       }
+    })
+      .then((fn) => {
+        unlistenMeterFn = fn;
+      })
+      .catch((err) => {
+        console.warn("Could not attach audio_meter listener:", err);
+      });
+
+    return () => {
+      if (unlistenLangFn) unlistenLangFn();
+      if (unlistenMeterFn) unlistenMeterFn();
     };
   }, []);
 
@@ -425,6 +441,7 @@ export default function App() {
               isPaused={isPaused}
               micEnabled={micEnabled}
               systemAudioEnabled={systemAudioEnabled}
+              audioLevel={isPaused ? 0 : audioLevel}
               onToggleTrack={handleToggleTrack}
               onTogglePause={() => setIsPaused((prev) => !prev)}
               onStopAndSave={handleStopAndSave}

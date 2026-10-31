@@ -451,23 +451,75 @@ html, body, #root {
   user-select: none;
 }
 
-/* Diamond Symmetrical Waveform */
-.diamond-waveform {
+/* Breathing / Real-Time Audio Waveform */
+.waveform-container {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  height: 110px;
-  padding: 0 20px;
+  gap: 6px;
+  height: 96px;
+  transition: opacity 250ms ease, filter 250ms ease;
 }
 
-.waveform-bar {
-  width: 3.5px;
-  background: linear-gradient(180deg, var(--gold-hover) 0%, var(--gold-primary) 50%, var(--gold-dark) 100%);
-  border-radius: 2px;
-  transition: height 0.08s ease;
-  min-height: 6px;
-  box-shadow: 0 0 6px rgba(223, 184, 108, 0.2);
+.wave-bar {
+  width: 4px;
+  border-radius: 9999px;
+  background: linear-gradient(180deg, #F3C363 0%, #D89828 100%);
+  box-shadow: 0 0 12px rgba(243, 195, 99, 0.35);
+  transform-origin: center center; /* ensures scaleY pivots from middle */
+  transition: transform 70ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 150ms ease, box-shadow 200ms ease;
+  will-change: transform, opacity;
+}
+
+/* Fallback CSS animation mode when live telemetry is not attached */
+.waveform-container.css-animated .wave-bar {
+  animation: pulse-wave 1.4s ease-in-out infinite alternate;
+}
+
+/* Live regulated mode: disable CSS keyframe so hardware GPU transforms take full control */
+.waveform-container.live-regulated .wave-bar {
+  animation: none;
+}
+
+/* When all input tracks (Mic + System) are muted */
+.waveform-container.muted-tracks {
+  opacity: 0.45;
+  filter: grayscale(0.8);
+}
+
+.waveform-container.muted-tracks .wave-bar {
+  box-shadow: none;
+  background: #64748B;
+}
+
+/* When recording is paused */
+.waveform-container.is-paused .wave-bar {
+  animation-play-state: paused !important;
+}
+
+@keyframes pulse-wave {
+  0% {
+    transform: scaleY(0.25);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scaleY(0.95);
+    opacity: 1;
+  }
+  100% {
+    transform: scaleY(0.4);
+    opacity: 0.75;
+  }
+}
+
+/* Respect reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  .wave-bar {
+    animation: none !important;
+    transition: none !important;
+    transform: scaleY(0.7);
+    opacity: 0.9;
+  }
 }
 
 /* Recording Controls Bar */

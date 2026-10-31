@@ -3,125 +3,29 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
-// ─── Interfaces ───────────────────────────────────────────────
-export interface MeetingRecord {
-  id: string;
-  title: string;
-  created_at: string;
-  duration: string;
-  language_detected: string;
-  file_path: string;
-}
+// ── Types ──────────────────────────────────────────────────────
+import {
+  MeetingRecord,
+  TranscriptSegment,
+  MeetingDetail,
+  LiveLanguagePayload,
+  StopAndTranscribeResult,
+  TrackState,
+} from "./types/meeting";
 
-export interface MeetingDetail {
-  record: MeetingRecord;
-  transcript: string;
-}
+export type { MeetingRecord, TranscriptSegment, MeetingDetail };
 
-interface LiveLanguagePayload {
-  language: string;
-  confidence: number;
-  is_speech_active: boolean;
-}
+// ── Components ────────────────────────────────────────────────
+import { Sidebar } from "./components/sidebar/Sidebar";
+import { RecordingWorkspace } from "./components/recording/RecordingWorkspace";
+import { MeetingDetailWorkspace } from "./components/detail/MeetingDetailWorkspace";
+import { IdleWorkspace } from "./components/idle/IdleWorkspace";
+import { TranscribingOverlay } from "./components/common/TranscribingOverlay";
+import { ErrorBanner } from "./components/common/ErrorBanner";
+import { Toast } from "./components/common/Toast";
+import { formatDateMeta } from "./utils/formatters";
 
-interface TranscriptSegment {
-  speaker: string;
-  speakerIndex: number;
-  timecode: string;
-  text: string;
-}
-
-// ─── Helpers ──────────────────────────────────────────────────
-function formatElapsed(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-function formatDateMeta(isoOrString: string): string {
-  try {
-    const d = new Date(isoOrString);
-    if (isNaN(d.getTime())) return isoOrString;
-    return d.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    });
-  } catch {
-    return isoOrString;
-  }
-}
-
-/**
- * Parses transcript into formatted speech segments.
- * If the transcript already contains speaker tags, parses them.
- * Otherwise creates natural editorial paragraphs with speaker turns.
- */
-function parseTranscriptToSegments(text: string): TranscriptSegment[] {
-  if (!text || text.trim().length === 0) {
-    return [];
-  }
-
-  const lines = text.split("\n").filter((l) => l.trim().length > 0);
-  const segments: TranscriptSegment[] = [];
-
-  // Match pattern like: "00:00 Speaker 1: Hello" or "Speaker 1: Hello"
-  const speakerRegex = /^(?:(\d{2}:\d{2})\s+)?Speaker\s+(\d+)[:\s]+(.*)$/i;
-
-  let currentSpeaker = 1;
-  let currentTimecodeSec = 0;
-
-  for (const line of lines) {
-    const match = line.match(speakerRegex);
-    if (match) {
-      const timeStr = match[1] || formatElapsed(currentTimecodeSec);
-      const spkIdx = parseInt(match[2], 10) || 1;
-      const speech = match[3] || "";
-      segments.push({
-        speaker: `Speaker ${spkIdx}`,
-        speakerIndex: spkIdx,
-        timecode: timeStr,
-        text: speech.trim(),
-      });
-      currentTimecodeSec += 45;
-    } else {
-      // Chunk into realistic speaker turns if plain text
-      segments.push({
-        speaker: `Speaker ${currentSpeaker}`,
-        speakerIndex: currentSpeaker,
-        timecode: formatElapsed(currentTimecodeSec),
-        text: line.trim(),
-      });
-      currentSpeaker = currentSpeaker >= 3 ? 1 : currentSpeaker + 1;
-      currentTimecodeSec += 38;
-    }
-  }
-
-  return segments;
-}
-
-/**
- * Highlights Bengali Unicode script (\u0980-\u09FF) in subtle golden badges
- * matching the user's design reference.
- */
-function renderBilingualText(text: string) {
-  // Regex to split words containing Bengali characters
-  const parts = text.split(/([\u0980-\u09FF\u0981-\u09FD]+(?:-[\w]+)?)/g);
-
-  return parts.map((part, index) => {
-    if (/[\u0980-\u09FF]/.test(part)) {
-      return (
-        <span key={index} className="bn-highlight">
-          {part}
-        </span>
-      );
-    }
-    return <span key={index}>{part}</span>;
-  });
-}
-
-// ─── Main Application Component ───────────────────────────────
+// ── Main Application Component ───────────────────────────────
 export default function App() {
   // App views: "recording" | "detail" | "idle"
   const [view, setView] = useState<"recording" | "detail" | "idle">("idle");
@@ -129,6 +33,10 @@ export default function App() {
   const [isPaused, setIsPaused] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+
+  // Audio track states (In / Out)
+  const [micEnabled, setMicEnabled] = useState(true);
+  const [systemAudioEnabled, setSystemAudioEnabled] = useState(true);
 
   // History & active detail
   const [history, setHistory] = useState<MeetingRecord[]>([]);
@@ -138,11 +46,10 @@ export default function App() {
   // Live language telemetry
   const [detectedLanguage, setDetectedLanguage] = useState<string>("Bangla");
 
-
   // Sidebar toggle
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
-  // Toast / feedback notifications
+  // Feedback notifications
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -151,6 +58,37 @@ export default function App() {
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3000);
+  };
+
+  // ── Sync initial audio track states ──
+  useEffect(() => {
+    invoke<TrackState>("get_track_state")
+      .then((state) => {
+        setMicEnabled(state.mic_enabled);
+        setSystemAudioEnabled(state.system_enabled);
+      })
+      .catch((err) => console.warn("Failed to query track state:", err));
+  }, []);
+
+  // ── Action: Toggle Track In/Out ──
+  const handleToggleTrack = async (track: "mic" | "system") => {
+    const nextState = track === "mic" ? !micEnabled : !systemAudioEnabled;
+    if (track === "mic") {
+      setMicEnabled(nextState);
+    } else {
+      setSystemAudioEnabled(nextState);
+    }
+
+    try {
+      await invoke("set_track_state", { track, enabled: nextState });
+      showToast(
+        `${track === "mic" ? "Microphone (In)" : "Speaker (Out)"} ${
+          nextState ? "Enabled" : "Muted"
+        }`
+      );
+    } catch (err) {
+      console.warn("Failed to set track state:", err);
+    }
   };
 
   // ── Load meeting history from backend ──
@@ -235,13 +173,7 @@ export default function App() {
     setErrorMessage(null);
 
     try {
-      const result = await invoke<{
-        id: string;
-        transcript: string;
-        file_path: string;
-        language_detected: string;
-        duration: string;
-      }>("stop_and_transcribe");
+      const result = await invoke<StopAndTranscribeResult>("stop_and_transcribe");
 
       setIsTranscribing(false);
       showToast("Meeting transcribed and saved.");
@@ -257,7 +189,6 @@ export default function App() {
           transcript: result.transcript,
         });
       } else {
-        // Fallback detail
         setCurrentDetail({
           record: {
             id: result.id,
@@ -282,7 +213,6 @@ export default function App() {
   // ── Action: Select and Load Meeting Detail ──
   const handleSelectMeeting = async (id: string) => {
     if (isRecording) {
-      // Don't interrupt recording, just view recording screen
       setView("recording");
       return;
     }
@@ -318,7 +248,6 @@ export default function App() {
           : null
       );
 
-      // Refresh list
       fetchHistory();
     } catch (err) {
       setErrorMessage(String(err));
@@ -347,14 +276,31 @@ export default function App() {
   // ── Action: Copy Transcript ──
   const handleCopyTranscript = () => {
     if (!currentDetail) return;
-    navigator.clipboard.writeText(currentDetail.transcript);
+    const text = Array.isArray(currentDetail.transcript)
+      ? currentDetail.transcript
+          .map((s) => `[${s.timestamp}] ${s.speaker}: ${s.text}`)
+          .join("\n\n")
+      : String(currentDetail.transcript);
+    navigator.clipboard.writeText(text);
     showToast("Transcript copied to clipboard.");
   };
 
   // ── Action: Export Markdown ──
   const handleExportMarkdown = () => {
     if (!currentDetail) return;
-    const blob = new Blob([currentDetail.transcript], { type: "text/markdown" });
+    const dialogue = Array.isArray(currentDetail.transcript)
+      ? currentDetail.transcript
+          .map((s) => `**[${s.timestamp}] ${s.speaker}:** ${s.text}`)
+          .join("\n\n")
+      : String(currentDetail.transcript);
+
+    const md = `# ${currentDetail.record.title}\n\n- **Date:** ${formatDateMeta(
+      currentDetail.record.created_at
+    )}\n- **Duration:** ${currentDetail.record.duration}\n- **Language:** ${
+      currentDetail.record.language_detected
+    }\n\n---\n\n## Transcript\n\n${dialogue}\n`;
+
+    const blob = new Blob([md], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -364,96 +310,25 @@ export default function App() {
     showToast("Markdown exported.");
   };
 
-  // Waveform bars height generator for the classic diamond shape
-  const waveformHeights = [
-    12, 18, 26, 38, 52, 68, 86, 98, 106, 98, 86, 68, 52, 38, 26, 18, 12,
-  ];
-
   return (
     <div className="vanilla-app">
-      {/* ── SIDEBAR ── */}
-      <aside className={`sidebar ${sidebarOpen ? "" : "collapsed"}`}>
-        <div className="sidebar-header">
-          <div className="logo-row">
-            <span className="brand-title">Vanilla</span>
-          </div>
+      {/* ── Left Sidebar ── */}
+      <Sidebar
+        isOpen={sidebarOpen}
+        isRecording={isRecording}
+        history={history}
+        selectedMeetingId={selectedMeetingId}
+        onStartRecording={handleStartRecording}
+        onViewRecording={() => setView("recording")}
+        onSelectMeeting={handleSelectMeeting}
+        onDeleteMeeting={handleDeleteMeeting}
+        onSettingsClick={() => showToast("Vanilla Local-First Studio v0.1.0")}
+      />
 
-          {isRecording ? (
-            <button
-              className="sidebar-action-btn recording-active"
-              onClick={() => setView("recording")}
-            >
-              <div className="status-indicator-dot" />
-              <span>Recording in progress</span>
-            </button>
-          ) : (
-            <button
-              className="sidebar-action-btn new-meeting"
-              onClick={handleStartRecording}
-            >
-              <span>+ New meeting</span>
-            </button>
-          )}
-        </div>
-
-        {/* History Meetings List */}
-        <div className="meetings-list-container">
-          {history.length === 0 ? (
-            <div className="empty-list-hint">
-              No meetings recorded yet.<br />Click <strong>+ New meeting</strong> to start.
-            </div>
-          ) : (
-            history.map((item) => {
-              const isSelected = selectedMeetingId === item.id;
-              return (
-                <div
-                  key={item.id}
-                  className={`meeting-list-item ${isSelected ? "selected" : ""}`}
-                  onClick={() => handleSelectMeeting(item.id)}
-                >
-                  <div className="item-content">
-                    <span className="item-title">{item.title}</span>
-                    <span className="item-meta">
-                      {formatDateMeta(item.created_at)} · {item.duration}
-                    </span>
-                  </div>
-
-                  <div className="item-actions">
-                    {isSelected ? (
-                      <span className="item-check-icon">✓</span>
-                    ) : (
-                      <span className="item-chevron">›</span>
-                    )}
-                    <button
-                      className="item-delete-btn"
-                      title="Delete meeting"
-                      onClick={(e) => handleDeleteMeeting(e, item.id)}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                </div>
-              );
-            })
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="sidebar-footer">
-          <button
-            className="settings-btn"
-            onClick={() => showToast("Vanilla Local-First Studio v0.1.0")}
-          >
-            <span>⚙</span>
-            <span>Settings</span>
-          </button>
-        </div>
-      </aside>
-
-      {/* ── MAIN WORKSPACE ── */}
+      {/* ── Right Main Canvas ── */}
       <main className="main-canvas">
-        {/* Canvas Top Bar */}
-        <div className="canvas-topbar">
+        {/* Top Header / Breadcrumb Bar */}
+        <div className="canvas-header-bar">
           <button
             className="sidebar-toggle-btn"
             onClick={() => setSidebarOpen((prev) => !prev)}
@@ -463,207 +338,62 @@ export default function App() {
           </button>
         </div>
 
-        {/* Error notification banner if any */}
-        {errorMessage && (
-          <div className="error-banner">
-            <span>⚠️ {errorMessage}</span>
-            <button
-              className="error-close-btn"
-              onClick={() => setErrorMessage(null)}
-            >
-              ✕
-            </button>
-          </div>
-        )}
+        {/* Error notification banner */}
+        <ErrorBanner
+          message={errorMessage}
+          onDismiss={() => setErrorMessage(null)}
+        />
 
         {/* Canvas Workspace Body */}
         <div className="canvas-content">
-          {/* ── TRANSCRIBING STATE ── */}
-          {isTranscribing && (
-            <div className="transcribing-overlay">
-              <div className="classic-spinner" />
-              <div className="transcribing-label">Transcribing audio locally…</div>
-              <div className="transcribing-sub">
-                Processing speech using local Whisper model. Private and offline.
-              </div>
-            </div>
-          )}
+          {isTranscribing && <TranscribingOverlay />}
 
-          {/* ── VIEW 1: RECORDING WORKSPACE ── */}
           {!isTranscribing && view === "recording" && (
-            <div className="recording-workspace">
-              <div className="recording-center-stage">
-                {/* Detected Language Pill */}
-                <div className="detected-pill">
-                  <div className="status-indicator-dot" />
-                  <span>Detected: {detectedLanguage}</span>
-                </div>
-
-                {/* Classic Editorial Serif Timer */}
-                <div className="classic-timer">{formatElapsed(elapsed)}</div>
-
-                {/* Symmetrical Diamond Waveform */}
-                <div className="diamond-waveform">
-                  {waveformHeights.map((h, i) => {
-                    // Organic micro-animation variance while recording
-                    const heightVariance = isPaused
-                      ? 6
-                      : Math.max(
-                          6,
-                          h + (i % 2 === 0 ? Math.sin(elapsed * 2 + i) * 14 : -Math.cos(elapsed * 2 + i) * 10)
-                        );
-
-                    return (
-                      <div
-                        key={i}
-                        className="waveform-bar"
-                        style={{ height: `${heightVariance}px` }}
-                      />
-                    );
-                  })}
-                </div>
-
-                {/* Controls Bar */}
-                <div className="recording-controls-bar">
-                  <button
-                    className="control-circle-btn"
-                    onClick={() => setIsPaused((prev) => !prev)}
-                    title={isPaused ? "Resume" : "Pause"}
-                  >
-                    {isPaused ? "▶" : "❚❚"}
-                  </button>
-
-                  <button
-                    className="stop-save-btn"
-                    onClick={handleStopAndSave}
-                  >
-                    <div className="stop-icon-square" />
-                    <span>Stop & save</span>
-                  </button>
-                </div>
-              </div>
-            </div>
+            <RecordingWorkspace
+              detectedLanguage={detectedLanguage}
+              elapsed={elapsed}
+              isPaused={isPaused}
+              micEnabled={micEnabled}
+              systemAudioEnabled={systemAudioEnabled}
+              onToggleTrack={handleToggleTrack}
+              onTogglePause={() => setIsPaused((prev) => !prev)}
+              onStopAndSave={handleStopAndSave}
+            />
           )}
 
-          {/* ── VIEW 2: MEETING DETAIL / REVIEW ── */}
           {!isTranscribing && view === "detail" && currentDetail && (
-            <div className="meeting-detail-workspace">
-              {/* Header Section */}
-              <div className="detail-header-section">
-                <input
-                  className="detail-title-input"
-                  value={currentDetail.record.title}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setCurrentDetail((prev) =>
-                      prev
-                        ? {
-                            ...prev,
-                            record: { ...prev.record, title: val },
-                          }
-                        : null
-                    );
-                  }}
-                  onBlur={(e) => handleRenameMeeting(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      (e.target as HTMLInputElement).blur();
-                    }
-                  }}
-                  title="Click to rename meeting"
-                />
-
-                <div className="detail-meta-row">
-                  <span className="meta-item">
-                    {formatDateMeta(currentDetail.record.created_at)}
-                  </span>
-                  <span className="meta-item">
-                    🕒 {currentDetail.record.duration}
-                  </span>
-                  <span className="meta-item">
-                    🌐 {currentDetail.record.language_detected}
-                  </span>
-                </div>
-
-                {/* Actions Bar */}
-                <div className="detail-actions-bar">
-                  <button
-                    className="detail-btn"
-                    onClick={handleCopyTranscript}
-                  >
-                    <span>📋</span>
-                    <span>Copy transcript</span>
-                  </button>
-
-                  <button
-                    className="detail-btn"
-                    onClick={handleExportMarkdown}
-                  >
-                    <span>📥</span>
-                    <span>Export Markdown</span>
-                  </button>
-
-                  <button
-                    className="detail-btn"
-                    onClick={(e) => handleDeleteMeeting(e, currentDetail.record.id)}
-                  >
-                    <span>🗑</span>
-                    <span>Delete</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Conversation Feed */}
-              <div className="conversation-feed">
-                {parseTranscriptToSegments(currentDetail.transcript).map(
-                  (segment, idx) => (
-                    <div key={idx} className="speech-segment">
-                      <div className={`speaker-avatar spk-${segment.speakerIndex}`}>
-                        {segment.speakerIndex}
-                      </div>
-
-                      <div className="speech-content">
-                        <div className="speech-header">
-                          <span className="speech-speaker-name">
-                            {segment.speaker}
-                          </span>
-                          <span className="speech-timecode">
-                            {segment.timecode}
-                          </span>
-                        </div>
-
-                        <div className="speech-body">
-                          {renderBilingualText(segment.text)}
-                        </div>
-                      </div>
-                    </div>
-                  )
-                )}
-              </div>
-            </div>
+            <MeetingDetailWorkspace
+              detail={currentDetail}
+              onTitleChange={(val) => {
+                setCurrentDetail((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        record: { ...prev.record, title: val },
+                      }
+                    : null
+                );
+              }}
+              onRename={handleRenameMeeting}
+              onCopyTranscript={handleCopyTranscript}
+              onExportMarkdown={handleExportMarkdown}
+              onDelete={handleDeleteMeeting}
+            />
           )}
 
-          {/* ── VIEW 3: IDLE / WELCOME WORKSPACE ── */}
           {!isTranscribing && view === "idle" && (
-            <div className="idle-workspace">
-              <div className="idle-logo">Vanilla</div>
-              <div className="idle-tagline">
-                Offline, local-first meeting transcription. Private and crafted with classic precision.
-              </div>
-              <button
-                className="idle-start-btn"
-                onClick={handleStartRecording}
-              >
-                <span>⏺</span>
-                <span>Start a new meeting</span>
-              </button>
-            </div>
+            <IdleWorkspace
+              micEnabled={micEnabled}
+              systemAudioEnabled={systemAudioEnabled}
+              onToggleTrack={handleToggleTrack}
+              onStartRecording={handleStartRecording}
+            />
           )}
         </div>
       </main>
 
       {/* ── Toast Notification ── */}
-      {toastMessage && <div className="toast-notice">{toastMessage}</div>}
+      <Toast message={toastMessage} />
     </div>
   );
 }

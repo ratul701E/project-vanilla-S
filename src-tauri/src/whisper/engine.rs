@@ -1,28 +1,34 @@
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-/// Transcribes raw audio samples using a local whisper.cpp model.
+/// A single structured transcript segment with speaker attribution and timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptSegment {
+    pub speaker: String,
+    pub text: String,
+    pub timestamp: String,
+    #[serde(default)]
+    pub timestamp_ms: u64,
+}
+
+/// Transcribes raw audio samples for a specific speaker using a local whisper.cpp model.
 ///
-/// # Arguments
-/// * `samples` — Raw PCM audio samples (any sample rate).
-/// * `sample_rate` — The sample rate `samples` were recorded at.
-/// * `model_path` — Absolute path to a GGML `.bin` model file.
-///
-/// # Returns
-/// The full transcript as a `String`, or a descriptive error.
-///
-/// # Resampling
-/// Whisper expects 16 kHz mono audio. If `sample_rate` differs, this
-/// function performs linear-interpolation resampling before inference.
-pub fn transcribe(samples: &[f32], sample_rate: u32, model_path: &Path) -> Result<String, String> {
+/// Returns an array of structured `TranscriptSegment` objects tagged with `speaker`
+/// and precise timestamps extracted directly from Whisper inference tokens.
+pub fn transcribe_track(
+    samples: &[f32],
+    sample_rate: u32,
+    model_path: &Path,
+    speaker: &str,
+) -> Result<Vec<TranscriptSegment>, String> {
     if samples.is_empty() {
-        return Err("No audio samples to transcribe".to_string());
+        return Ok(Vec::new());
     }
 
     if !model_path.exists() {
         return Err(format!(
-            "Whisper model not found at: {}. \
-             Please download a GGML model (e.g., ggml-base.bin) and place it there.",
+            "Whisper model not found at: {}. Please download a GGML model (e.g., ggml-base.bin) and place it there.",
             model_path.display()
         ));
     }
@@ -36,7 +42,9 @@ pub fn transcribe(samples: &[f32], sample_rate: u32, model_path: &Path) -> Resul
 
     // --- Initialize the Whisper context ---
     let ctx = WhisperContext::new_with_params(
-        model_path.to_str().ok_or_else(|| "Invalid model path encoding".to_string())?,
+        model_path
+            .to_str()
+            .ok_or_else(|| "Invalid model path encoding".to_string())?,
         WhisperContextParameters::default(),
     )
     .map_err(|e| format!("Failed to load Whisper model: {e}"))?;
@@ -51,32 +59,34 @@ pub fn transcribe(samples: &[f32], sample_rate: u32, model_path: &Path) -> Resul
     // "auto" language detection supports English ↔ Bengali code-switching.
     params.set_language(Some("auto"));
 
-    // Use 4 threads for inference (good default for modern desktops).
+    // Use 4 threads for inference.
     params.set_n_threads(4);
 
-    // Disable printing to stdout — we collect results programmatically.
+    // Disable printing to stdout.
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
 
-    // Do NOT enforce token timestamps: on short or quiet audio it causes
-    // whisper.cpp to trigger "single timestamp ending - skip entire chunk".
+    // Do NOT enforce token timestamps to avoid "single timestamp ending" chunk drops.
     params.set_token_timestamps(false);
 
     let duration_sec = audio_16k.len() as f32 / 16000.0;
-    println!("Running Whisper inference on {:.2}s of 16kHz mono audio ({} samples)...", duration_sec, audio_16k.len());
+    println!(
+        "Running Whisper inference for '{}' on {:.2}s of 16kHz audio ({} samples)...",
+        speaker,
+        duration_sec,
+        audio_16k.len()
+    );
 
     // --- Run inference ---
     state
         .full(params, &audio_16k)
-        .map_err(|e| format!("Whisper inference failed: {e}"))?;
+        .map_err(|e| format!("Whisper inference failed for {speaker}: {e}"))?;
 
-    // --- Collect transcript segments ---
+    // --- Collect structured transcript segments ---
     let num_segments = state.full_n_segments();
-    println!("Whisper generated {num_segments} segments");
-
-    let mut transcript = String::new();
+    let mut segments = Vec::new();
 
     for i in 0..num_segments {
         if let Some(segment) = state.get_segment(i) {
@@ -85,29 +95,30 @@ pub fn transcribe(samples: &[f32], sample_rate: u32, model_path: &Path) -> Resul
                 .map_err(|e| format!("Failed to decode segment {i}: {e}"))?;
 
             let trimmed = segment_text.trim();
-            // Ignore non-speech tags like [Music], [Applause], etc.
-            if !trimmed.is_empty() {
-                if !transcript.is_empty() && !segment_text.starts_with(' ') {
-                    transcript.push(' ');
-                }
-                transcript.push_str(trimmed);
+            // Ignore empty segments or non-speech music tags
+            if !trimmed.is_empty() && trimmed != "[BLANK_AUDIO]" {
+                // start_timestamp returns centiseconds (10ms units)
+                let start_cs = segment.start_timestamp().max(0);
+                let timestamp_ms = (start_cs as u64) * 10;
+                let total_secs = timestamp_ms / 1000;
+                let mins = total_secs / 60;
+                let secs = total_secs % 60;
+                let timestamp = format!("{:02}:{:02}", mins, secs);
+
+                segments.push(TranscriptSegment {
+                    speaker: speaker.to_string(),
+                    text: trimmed.to_string(),
+                    timestamp,
+                    timestamp_ms,
+                });
             }
         }
     }
 
-    if transcript.is_empty() {
-        return Ok("(No speech detected in this recording)".to_string());
-    }
-
-    Ok(transcript)
+    Ok(segments)
 }
 
 /// Linear-interpolation resampling from `from_rate` → `to_rate`.
-///
-/// This is a simple but effective approach for speech audio where
-/// ultra-precise resampling isn't critical. For meeting audio at
-/// typical sample rates (44.1 kHz, 48 kHz → 16 kHz), this produces
-/// quality indistinguishable from more complex algorithms.
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if samples.is_empty() || from_rate == to_rate {
         return samples.to_vec();

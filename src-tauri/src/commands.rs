@@ -1,9 +1,9 @@
 use crate::audio::recorder::AudioRecorder;
 use crate::storage::history::{self, MeetingDetail, MeetingRecord};
 use crate::storage::local_files;
-use crate::whisper::engine;
+use crate::whisper::engine::{self, TranscriptSegment};
 use chrono::{DateTime, Local};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
@@ -19,10 +19,17 @@ pub struct AppState {
 #[derive(Serialize)]
 pub struct TranscriptionResult {
     pub id: String,
-    pub transcript: String,
+    pub transcript: Vec<TranscriptSegment>,
     pub file_path: String,
     pub language_detected: String,
     pub duration: String,
+}
+
+/// Payload for live track enable states over IPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackState {
+    pub mic_enabled: bool,
+    pub system_enabled: bool,
 }
 
 /// Payload sent via Tauri event during active recording.
@@ -33,8 +40,39 @@ pub struct LiveLanguagePayload {
     pub is_speech_active: bool,
 }
 
-/// Starts capturing audio from the default microphone and begins
-/// the live language detection telemetry emitter.
+/// Sets track enabled state ("mic" or "system").
+#[tauri::command]
+pub async fn set_track_state(
+    state: tauri::State<'_, AppState>,
+    track: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let recorder = state
+        .recorder
+        .lock()
+        .map_err(|e| format!("Failed to lock recorder state: {e}"))?;
+    recorder.set_track_enabled(&track, enabled);
+    Ok(())
+}
+
+/// Retrieves current enabled state of mic and system audio.
+#[tauri::command]
+pub async fn get_track_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<TrackState, String> {
+    let recorder = state
+        .recorder
+        .lock()
+        .map_err(|e| format!("Failed to lock recorder state: {e}"))?;
+    let (mic_enabled, system_enabled) = recorder.get_track_state();
+    Ok(TrackState {
+        mic_enabled,
+        system_enabled,
+    })
+}
+
+/// Starts capturing audio from the default microphone and system loopback,
+/// and begins the live language detection telemetry emitter.
 #[tauri::command]
 pub async fn start_meeting(
     app_handle: tauri::AppHandle,
@@ -90,8 +128,8 @@ pub async fn start_meeting(
     Ok("Recording started".to_string())
 }
 
-/// Stops recording, runs Whisper transcription, classifies language,
-/// writes the markdown note, and saves a history record into meetings_index.json.
+/// Stops recording, runs Whisper transcription on both mic and system tracks independently,
+/// interleaves segments chronologically, writes markdown notes and sidecar JSON, and saves history.
 #[tauri::command]
 pub async fn stop_and_transcribe(
     app_handle: tauri::AppHandle,
@@ -100,19 +138,19 @@ pub async fn stop_and_transcribe(
     // Halt live language detection telemetry
     state.is_recording.store(false, Ordering::SeqCst);
 
-    // --- Step 1: Stop recording and drain the buffer ---
-    let (samples, sample_rate) = {
+    // --- Step 1: Stop recording and drain both tracks ---
+    let (mic_track, system_track) = {
         let mut recorder = state
             .recorder
             .lock()
             .map_err(|e| format!("Failed to lock recorder state: {e}"))?;
 
         recorder.stop();
-        recorder.take_samples()
+        recorder.take_tracks()
     }; // MutexGuard dropped here — no lock held during inference
 
-    if samples.is_empty() {
-        return Err("No audio was recorded. Please check your microphone.".to_string());
+    if mic_track.samples.is_empty() && system_track.samples.is_empty() {
+        return Err("No audio was recorded on any active track. Please check your microphone and speaker settings.".to_string());
     }
 
     // --- Step 2: Resolve the model path dynamically ---
@@ -123,9 +161,47 @@ pub async fn stop_and_transcribe(
 
     let model_path = app_data_dir.join("models").join("ggml-base.bin");
 
-    // --- Step 3: Run Whisper inference on a blocking thread ---
-    let transcript = tokio::task::spawn_blocking(move || {
-        engine::transcribe(&samples, sample_rate, &model_path)
+    // --- Step 3: Run Whisper inference on blocking thread ---
+    let segments = tokio::task::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
+        let mut all_segments = Vec::new();
+
+        // 1. Transcribe Microphone ("You")
+        if !mic_track.samples.is_empty() {
+            println!("Transcribing microphone track ({} samples)...", mic_track.samples.len());
+            match engine::transcribe_track(&mic_track.samples, mic_track.sample_rate, &model_path, "You") {
+                Ok(mic_segs) => {
+                    println!("Microphone track yielded {} segments", mic_segs.len());
+                    all_segments.extend(mic_segs);
+                }
+                Err(e) => eprintln!("Error transcribing mic track: {e}"),
+            }
+        }
+
+        // 2. Transcribe System Audio Loopback ("Participant")
+        if !system_track.samples.is_empty() {
+            println!("Transcribing system audio track ({} samples)...", system_track.samples.len());
+            match engine::transcribe_track(&system_track.samples, system_track.sample_rate, &model_path, "Participant") {
+                Ok(sys_segs) => {
+                    println!("System audio track yielded {} segments", sys_segs.len());
+                    all_segments.extend(sys_segs);
+                }
+                Err(e) => eprintln!("Error transcribing system track: {e}"),
+            }
+        }
+
+        // 3. Chronologically sort interleaved segments
+        all_segments.sort_by_key(|s| s.timestamp_ms);
+
+        if all_segments.is_empty() {
+            all_segments.push(TranscriptSegment {
+                speaker: "System".to_string(),
+                text: "(No speech detected in this recording)".to_string(),
+                timestamp: "00:00".to_string(),
+                timestamp_ms: 0,
+            });
+        }
+
+        Ok(all_segments)
     })
     .await
     .map_err(|e| format!("Transcription task panicked: {e}"))??;
@@ -146,11 +222,17 @@ pub async fn stop_and_transcribe(
     let duration_secs = duration_span.num_seconds() % 60;
     let duration_str = format!("{duration_mins}m {duration_secs}s");
 
-    // --- Step 5: Classify language based on script/character distribution ---
-    let language_detected = history::classify_transcript_language(&transcript);
+    // --- Step 5: Classify language based on aggregated segment text ---
+    let full_text: String = segments
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
 
-    // --- Step 6: Save the transcript to a Markdown file ---
-    let file_path = local_files::save_transcript(&app_data_dir, &transcript, started_at)?;
+    let language_detected = history::classify_transcript_language(&full_text);
+
+    // --- Step 6: Save the transcript to Markdown and JSON sidecar ---
+    let file_path = local_files::save_transcript_segments(&app_data_dir, &segments, started_at)?;
 
     let file_path_str = file_path
         .to_str()
@@ -170,14 +252,13 @@ pub async fn stop_and_transcribe(
         file_path: file_path_str.clone(),
     };
 
-    // Store in history index (non-fatal if index fails, but logged)
     if let Err(e) = history::add_meeting(&app_data_dir, record) {
         eprintln!("Warning: Failed to save meeting to history index: {e}");
     }
 
     Ok(TranscriptionResult {
         id: meeting_id,
-        transcript,
+        transcript: segments,
         file_path: file_path_str,
         language_detected,
         duration: duration_str,
@@ -216,7 +297,7 @@ pub async fn rename_meeting(
     history::update_meeting_title(&app_data_dir, &id, &new_title)
 }
 
-/// Loads full details (metadata + transcript) for a single meeting by ID.
+/// Loads full details (metadata + structured transcript segments) for a single meeting by ID.
 #[tauri::command]
 pub async fn get_meeting_detail(
     app_handle: tauri::AppHandle,
@@ -230,7 +311,7 @@ pub async fn get_meeting_detail(
     history::get_meeting_detail(&app_data_dir, &id)
 }
 
-/// Deletes a meeting from `meetings_index.json` and deletes its markdown file from disk.
+/// Deletes a meeting from `meetings_index.json` and deletes its files from disk.
 #[tauri::command]
 pub async fn delete_meeting(app_handle: tauri::AppHandle, id: String) -> Result<bool, String> {
     let app_data_dir = app_handle

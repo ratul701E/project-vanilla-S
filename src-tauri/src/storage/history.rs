@@ -1,3 +1,4 @@
+use crate::whisper::engine::TranscriptSegment;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,11 +14,11 @@ pub struct MeetingRecord {
     pub file_path: String,
 }
 
-/// Full meeting details including metadata and the full transcript text.
+/// Full meeting details including metadata and structured transcript segments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingDetail {
     pub record: MeetingRecord,
-    pub transcript: String,
+    pub transcript: Vec<TranscriptSegment>,
 }
 
 /// Returns the path to the meetings index JSON file.
@@ -48,7 +49,6 @@ pub fn load_history(app_data_dir: &Path) -> Result<Vec<MeetingRecord>, String> {
 
 /// Saves the list of meeting records to `meetings_index.json`.
 pub fn save_history(app_data_dir: &Path, records: &[MeetingRecord]) -> Result<(), String> {
-    // Ensure parent directory exists
     if !app_data_dir.exists() {
         fs::create_dir_all(app_data_dir)
             .map_err(|e| format!("Failed to create app data directory: {e}"))?;
@@ -97,7 +97,7 @@ pub fn update_meeting_title(
 
     save_history(app_data_dir, &history)?;
 
-    // Optionally update the title in the markdown file header if it exists
+    // Update the title in the markdown file header if it exists
     if let Some(file_str) = target_file_path {
         let md_path = PathBuf::from(&file_str);
         if md_path.exists() {
@@ -117,7 +117,7 @@ pub fn update_meeting_title(
     Ok(true)
 }
 
-/// Loads full details (record + transcript) for a single meeting by ID.
+/// Loads full details (record + structured transcript segments) for a single meeting by ID.
 pub fn get_meeting_detail(app_data_dir: &Path, id: &str) -> Result<MeetingDetail, String> {
     let history = load_history(app_data_dir)?;
     let record = history
@@ -126,25 +126,91 @@ pub fn get_meeting_detail(app_data_dir: &Path, id: &str) -> Result<MeetingDetail
         .ok_or_else(|| format!("Meeting with ID '{id}' not found"))?;
 
     let file_path = PathBuf::from(&record.file_path);
-    let transcript = if file_path.exists() {
-        let content = fs::read_to_string(&file_path)
-            .map_err(|e| format!("Failed to read transcript file: {e}"))?;
-        
-        // Extract transcript part if it has "## Transcript" section
-        if let Some(idx) = content.find("## Transcript") {
-            let body = &content[idx + "## Transcript".len()..];
-            body.trim().to_string()
+
+    // 1. Try reading the high-fidelity JSON sidecar first
+    let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let json_sidecar = file_path.with_file_name(format!("{stem}_segments.json"));
+
+    let segments = if json_sidecar.exists() {
+        if let Ok(content) = fs::read_to_string(&json_sidecar) {
+            serde_json::from_str::<Vec<TranscriptSegment>>(&content).unwrap_or_default()
         } else {
-            content
+            Vec::new()
+        }
+    } else if file_path.exists() {
+        // Fallback: Parse existing markdown file
+        if let Ok(content) = fs::read_to_string(&file_path) {
+            parse_markdown_to_segments(&content)
+        } else {
+            Vec::new()
         }
     } else {
-        "(Transcript file not found on disk)".to_string()
+        Vec::new()
     };
 
-    Ok(MeetingDetail { record, transcript })
+    Ok(MeetingDetail {
+        record,
+        transcript: segments,
+    })
 }
 
-/// Deletes a meeting from the index and removes its markdown file from disk.
+/// Fallback helper to parse legacy markdown files into structured segments
+fn parse_markdown_to_segments(content: &str) -> Vec<TranscriptSegment> {
+    let mut segments = Vec::new();
+
+    let body = if let Some(idx) = content.find("## Transcript") {
+        &content[idx + "## Transcript".len()..]
+    } else {
+        content
+    };
+
+    let mut current_speaker = "You".to_string();
+    let mut current_time = "00:00".to_string();
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("---") {
+            continue;
+        }
+
+        // Check for pattern: **[00:05] You:** Hello OR [00:05] Speaker: Hello
+        if let Some(clean) = trimmed.strip_prefix("**[").or_else(|| trimmed.strip_prefix("[")) {
+            if let Some(close_bracket) = clean.find(']') {
+                let time_str = &clean[..close_bracket];
+                let remainder = &clean[close_bracket + 1..];
+                let remainder_clean = remainder.trim_start().trim_start_matches(':').trim_start();
+
+                if let Some(colon_idx) = remainder_clean.find(':') {
+                    let speaker = remainder_clean[..colon_idx].trim().trim_end_matches('*').trim();
+                    let text = remainder_clean[colon_idx + 1..].trim().trim_end_matches('*').trim();
+                    current_speaker = speaker.to_string();
+                    current_time = time_str.to_string();
+
+                    if !text.is_empty() {
+                        segments.push(TranscriptSegment {
+                            speaker: current_speaker.clone(),
+                            text: text.to_string(),
+                            timestamp: current_time.clone(),
+                            timestamp_ms: 0,
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
+
+        segments.push(TranscriptSegment {
+            speaker: current_speaker.clone(),
+            text: trimmed.to_string(),
+            timestamp: current_time.clone(),
+            timestamp_ms: 0,
+        });
+    }
+
+    segments
+}
+
+/// Deletes a meeting from the index and removes its markdown file and JSON sidecar from disk.
 pub fn delete_meeting(app_data_dir: &Path, id: &str) -> Result<bool, String> {
     let mut history = load_history(app_data_dir)?;
     let initial_len = history.len();
@@ -165,10 +231,15 @@ pub fn delete_meeting(app_data_dir: &Path, id: &str) -> Result<bool, String> {
 
     save_history(app_data_dir, &history)?;
 
-    // Clean up markdown file from disk
+    // Clean up markdown file and sidecar from disk
     if let Some(file_path) = file_to_delete {
         if file_path.exists() {
-            let _ = fs::remove_file(file_path);
+            let _ = fs::remove_file(&file_path);
+        }
+        let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let json_sidecar = file_path.with_file_name(format!("{stem}_segments.json"));
+        if json_sidecar.exists() {
+            let _ = fs::remove_file(json_sidecar);
         }
     }
 

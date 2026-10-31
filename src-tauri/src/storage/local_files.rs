@@ -1,23 +1,13 @@
+use crate::whisper::engine::TranscriptSegment;
 use chrono::{DateTime, Local};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Saves a meeting transcript as a Markdown file in the app's notes directory.
-///
-/// # Arguments
-/// * `app_data_dir` — The root app data directory (from Tauri's `app_data_dir()`).
-/// * `transcript` — The transcribed meeting text.
-/// * `started_at` — When the meeting recording began.
-///
-/// # Returns
-/// The absolute path to the saved Markdown file, or a descriptive error.
-///
-/// # Directory Structure
-/// Files are saved to `<app_data_dir>/notes/meeting_YYYY-MM-DD_HH-MM-SS.md`
-/// and the directory is auto-created if it doesn't exist.
-pub fn save_transcript(
+/// Saves structured meeting segments to a Markdown file in the notes directory,
+/// along with a structured JSON sidecar (`meeting_YYYY-MM-DD_HH-MM-SS_segments.json`).
+pub fn save_transcript_segments(
     app_data_dir: &Path,
-    transcript: &str,
+    segments: &[TranscriptSegment],
     started_at: DateTime<Local>,
 ) -> Result<PathBuf, String> {
     let notes_dir = app_data_dir.join("notes");
@@ -26,10 +16,19 @@ pub fn save_transcript(
     fs::create_dir_all(&notes_dir)
         .map_err(|e| format!("Failed to create notes directory: {e}"))?;
 
-    // Build a sortable, collision-free filename.
+    // Build sortable filenames based on start time.
     let timestamp = started_at.format("%Y-%m-%d_%H-%M-%S");
-    let filename = format!("meeting_{timestamp}.md");
-    let file_path = notes_dir.join(&filename);
+    let md_filename = format!("meeting_{timestamp}.md");
+    let json_filename = format!("meeting_{timestamp}_segments.json");
+
+    let md_path = notes_dir.join(&md_filename);
+    let json_path = notes_dir.join(&json_filename);
+
+    // Save structured JSON sidecar for exact IPC retrieval
+    let json_content = serde_json::to_string_pretty(segments)
+        .map_err(|e| format!("Failed to serialize transcript segments: {e}"))?;
+    fs::write(&json_path, json_content)
+        .map_err(|e| format!("Failed to write transcript segments JSON: {e}"))?;
 
     // Calculate approximate meeting duration.
     let ended_at = Local::now();
@@ -37,7 +36,19 @@ pub fn save_transcript(
     let duration_mins = duration.num_minutes();
     let duration_secs = duration.num_seconds() % 60;
 
-    // Build the Markdown content with frontmatter metadata.
+    // Build the Markdown formatted transcript
+    let mut formatted_transcript = String::new();
+    if segments.is_empty() {
+        formatted_transcript.push_str("(No speech detected in this recording)\n");
+    } else {
+        for seg in segments {
+            formatted_transcript.push_str(&format!(
+                "**[{}] {}:** {}\n\n",
+                seg.timestamp, seg.speaker, seg.text
+            ));
+        }
+    }
+
     let readable_date = started_at.format("%Y-%m-%d %H:%M:%S");
     let markdown = format!(
         r#"# Meeting Notes — {title_date}
@@ -49,17 +60,17 @@ pub fn save_transcript(
 
 ## Transcript
 
-{transcript}
+{formatted_transcript}
 "#,
         title_date = started_at.format("%B %d, %Y"),
         readable_date = readable_date,
         duration_mins = duration_mins,
         duration_secs = duration_secs,
-        transcript = transcript,
+        formatted_transcript = formatted_transcript.trim_end(),
     );
 
-    fs::write(&file_path, &markdown)
-        .map_err(|e| format!("Failed to write transcript file: {e}"))?;
+    fs::write(&md_path, &markdown)
+        .map_err(|e| format!("Failed to write transcript Markdown file: {e}"))?;
 
-    Ok(file_path)
+    Ok(md_path)
 }

@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Keystores and signing
+*.keystore
+*.jks
+keystore.properties

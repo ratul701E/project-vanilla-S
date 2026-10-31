@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "android": "powershell -ExecutionPolicy Bypass -File .\\build-android.ps1",
-    "android:build": "powershell -ExecutionPolicy Bypass -File .\\build-android.ps1"
+    "android:build": "powershell -ExecutionPolicy Bypass -File .\\build-android.ps1",
+    "android:release": "powershell -ExecutionPolicy Bypass -File .\\build-android.ps1 -Release",
+    "android:sign": "powershell -ExecutionPolicy Bypass -File .\\sign-android.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

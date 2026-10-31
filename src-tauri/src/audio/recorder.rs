@@ -165,7 +165,26 @@ impl AudioRecorder {
     }
 
     /// Returns `true` if the recorder currently has an active stream.
+    #[allow(dead_code)]
     pub fn is_recording(&self) -> bool {
         self.stream.is_some()
+    }
+
+    /// Returns the most recent `count` samples without draining the buffer.
+    /// Useful for live audio monitoring, visualization, and language heuristics.
+    #[allow(dead_code)]
+    pub fn peek_recent_samples(&self, count: usize) -> Vec<f32> {
+        if let Ok(buf) = self.buffer.lock() {
+            let start = buf.len().saturating_sub(count);
+            buf[start..].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Returns the current recording sample rate.
+    #[allow(dead_code)]
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 }

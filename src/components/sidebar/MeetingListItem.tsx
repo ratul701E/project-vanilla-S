@@ -1,6 +1,7 @@
 import React from "react";
 import { MeetingRecord } from "../../types/meeting";
 import { formatDateMeta } from "../../utils/formatters";
+import { Trash } from "lucide-react";
 
 interface MeetingListItemProps {
   item: MeetingRecord;
@@ -28,17 +29,12 @@ export const MeetingListItem: React.FC<MeetingListItemProps> = ({
       </div>
 
       <div className="item-actions">
-        {isSelected ? (
-          <span className="item-check-icon">✓</span>
-        ) : (
-          <span className="item-chevron">›</span>
-        )}
         <button
           className="item-delete-btn"
           title="Delete meeting"
           onClick={(e) => onDelete(e, item.id)}
         >
-          ✕
+          <Trash size={16} strokeWidth={1.8} />
         </button>
       </div>
     </div>

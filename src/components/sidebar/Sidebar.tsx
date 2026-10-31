@@ -1,6 +1,7 @@
 import React from "react";
 import { MeetingRecord } from "../../types/meeting";
 import { MeetingListItem } from "./MeetingListItem";
+import { Plus } from "lucide-react";
 
 interface SidebarProps {
   isOpen: boolean;
@@ -30,7 +31,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div className="sidebar-header">
         <div className="logo-row">
           <div className="logo-group">
-            <span className="logo-mark">V</span>
+            {/* <span className="logo-mark">V</span> */}
             <span className="logo-text">Vanilla</span>
           </div>
           <span className="version-pill">Local</span>
@@ -49,8 +50,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className="sidebar-action-btn new-meeting"
             onClick={onStartRecording}
           >
-            <span>+ New meeting</span>
+            <Plus size={14} />
+            <span>New meeting</span>
           </button>
+        )}
+      </div>
+
+      {/* Section Header */}
+      <div className="sidebar-section-header">
+        <span className="sidebar-section-title">All Captures</span>
+        {history.length > 0 && (
+          <span className="sidebar-section-badge">{history.length}</span>
         )}
       </div>
 
@@ -58,7 +68,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div className="meetings-list-container">
         {history.length === 0 ? (
           <div className="empty-list-hint">
-            No meetings recorded yet.<br />Click <strong>+ New meeting</strong> to start.
+            No captures recorded yet.<br />Click <strong>+ New meeting</strong> to start.
           </div>
         ) : (
           history.map((item) => (

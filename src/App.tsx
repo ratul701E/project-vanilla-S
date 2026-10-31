@@ -23,7 +23,9 @@ import { IdleWorkspace } from "./components/idle/IdleWorkspace";
 import { TranscribingOverlay } from "./components/common/TranscribingOverlay";
 import { ErrorBanner } from "./components/common/ErrorBanner";
 import { Toast } from "./components/common/Toast";
+import { ArrowLeftIcon, WaveformIcon } from "./components/common/Icons";
 import { formatDateMeta } from "./utils/formatters";
+import { PanelRightOpen, PanelLeftOpen } from "lucide-react";
 
 // ── Main Application Component ───────────────────────────────
 export default function App() {
@@ -88,6 +90,30 @@ export default function App() {
       );
     } catch (err) {
       console.warn("Failed to set track state:", err);
+    }
+  };
+
+  // ── Action: Set Audio Mode Preset ──
+  const handleSetAudioMode = async (mode: "everyone" | "participants" | "solo") => {
+    const nextMic = mode === "everyone" || mode === "solo";
+    const nextSystem = mode === "everyone" || mode === "participants";
+
+    setMicEnabled(nextMic);
+    setSystemAudioEnabled(nextSystem);
+
+    try {
+      await Promise.all([
+        invoke("set_track_state", { track: "mic", enabled: nextMic }),
+        invoke("set_track_state", { track: "system", enabled: nextSystem }),
+      ]);
+      const modeNames = {
+        everyone: "Everyone (Voice + System)",
+        participants: "Participants Only (System)",
+        solo: "Solo Only (Voice)",
+      };
+      showToast(`Mode: ${modeNames[mode]}`);
+    } catch (err) {
+      console.warn("Failed to set track state for mode:", err);
     }
   };
 
@@ -310,6 +336,12 @@ export default function App() {
     showToast("Markdown exported.");
   };
 
+  // ── Action: Back to Main Page ──
+  const handleBackToMain = () => {
+    setView("idle");
+    setSelectedMeetingId(null);
+  };
+
   return (
     <div className="vanilla-app">
       {/* ── Left Sidebar ── */}
@@ -322,21 +354,59 @@ export default function App() {
         onViewRecording={() => setView("recording")}
         onSelectMeeting={handleSelectMeeting}
         onDeleteMeeting={handleDeleteMeeting}
-        onSettingsClick={() => showToast("Vanilla Local-First Studio v0.1.0")}
+        onSettingsClick={() => showToast("TranscribeAI Local Studio v0.1.0")}
       />
 
       {/* ── Right Main Canvas ── */}
       <main className="main-canvas">
-        {/* Top Header / Breadcrumb Bar */}
-        <div className="canvas-header-bar">
-          <button
-            className="sidebar-toggle-btn"
-            onClick={() => setSidebarOpen((prev) => !prev)}
-            title="Toggle Sidebar"
-          >
-            ◫
-          </button>
-        </div>
+        {/* Top Header / Global Navigation Bar */}
+        <header className={`canvas-header-bar ${view === "idle" ? "idle-header-bar" : ""}`}>
+          <div className="canvas-header-left">
+            <button
+              className="sidebar-toggle-btn"
+              onClick={() => setSidebarOpen((prev) => !prev)}
+              title="Toggle Sidebar"
+            >
+              {
+                sidebarOpen ? <PanelRightOpen/> : <PanelLeftOpen/>
+              }
+            </button>
+
+            {view === "detail" && (
+              <button
+                className="header-back-btn"
+                onClick={handleBackToMain}
+                title="Back to main page"
+              >
+                <ArrowLeftIcon size={13} />
+                <span>Back</span>
+              </button>
+            )}
+
+            <div className="header-brand-nav">
+
+              {view === "detail" && currentDetail && (
+                <>
+                  <span className="nav-divider">/</span>
+                  <button
+                    className="nav-crumb-link"
+                    onClick={handleBackToMain}
+                    title="Back to Recordings"
+                  >
+                    Recordings
+                  </button>
+                  <span className="nav-divider">/</span>
+                  <span
+                    className="nav-crumb-current"
+                    title={currentDetail.record.title}
+                  >
+                    {currentDetail.record.title}
+                  </span>
+                </>
+              )}
+            </div>
+          </div>
+        </header>
 
         {/* Error notification banner */}
         <ErrorBanner
@@ -378,6 +448,7 @@ export default function App() {
               onCopyTranscript={handleCopyTranscript}
               onExportMarkdown={handleExportMarkdown}
               onDelete={handleDeleteMeeting}
+              onBack={handleBackToMain}
             />
           )}
 
@@ -386,6 +457,7 @@ export default function App() {
               micEnabled={micEnabled}
               systemAudioEnabled={systemAudioEnabled}
               onToggleTrack={handleToggleTrack}
+              onSetMode={handleSetAudioMode}
               onStartRecording={handleStartRecording}
             />
           )}
